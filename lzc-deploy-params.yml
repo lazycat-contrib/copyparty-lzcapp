@@ -1,0 +1,21 @@
+params:
+  - id: upload_user
+    type: string
+    name: Login username
+    description: "Account name copied verbatim into the copyarty config. Letters, digits and _ . @ - only; it is not created anywhere else."
+    default_value: copyparty
+    optional: false
+  - id: upload_secret
+    type: secret
+    name: Login secret
+    description: "At least 12 characters. Letters, digits and _ . ~ ! @ # % ^ + = - only, because the config format has no escaping. Applied on every container start."
+    default_value: "$random(len=24)"
+    optional: false
+locales:
+  zh:
+    upload_user:
+      name: 登录用户名
+      description: 会原样写入应用配置的账号名，只能用字母、数字和 _ . @ -。
+    upload_secret:
+      name: 登录密码
+      description: 至少 12 位，只能用字母、数字和 _ . ~ ! @ # % ^ + = -（配置格式无转义）。每次容器启动按该值重建账号。

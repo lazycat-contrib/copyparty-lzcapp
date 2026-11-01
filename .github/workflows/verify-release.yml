@@ -1,0 +1,130 @@
+name: Verify CopyParty Release on GitHub
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact LPK release tag
+        required: true
+        default: v1.20.26
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: copyparty-release-verification
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Download exact Release asset on runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          ASSET_NAME="community.lazycat.app.copyparty-${RELEASE_TAG}.lpk"
+          echo "ASSET_NAME=$ASSET_NAME" >> "$GITHUB_ENV"
+          gh release view "$RELEASE_TAG" --json tagName,assets > release-metadata.json
+          gh release download "$RELEASE_TAG" --pattern "$ASSET_NAME" --dir verify-pkg
+      - name: Verify artifact, closed account model and credential handling
+        shell: python
+        run: |
+          import hashlib, json, os, subprocess, sys, tarfile
+          from pathlib import Path
+
+          try:
+              import yaml
+          except ImportError:
+              subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', 'PyYAML==6.0.3'])
+              import yaml
+
+          name = os.environ['ASSET_NAME']
+          tag = os.environ['RELEASE_TAG']
+          version = tag.removeprefix('v')
+
+          meta = json.loads(Path('release-metadata.json').read_text())
+          assets = [a for a in meta['assets'] if a['name'] == name]
+          assert len(assets) == 1, assets
+          pkg = Path('verify-pkg') / name
+
+          h = hashlib.sha256()
+          with pkg.open('rb') as f:
+              for chunk in iter(lambda: f.read(8 * 1024 * 1024), b''):
+                  h.update(chunk)
+          assert 'sha256:' + h.hexdigest() == assets[0]['digest'], 'Release digest mismatch'
+
+          with tarfile.open(pkg) as package:
+              names = set(package.getnames())
+              assert {'package.yml', 'manifest.yml', 'deploy_params.yml', 'content.tar', 'icon.png'} <= names, names
+
+              info = yaml.safe_load(package.extractfile('package.yml').read())
+              assert info['package'] == 'community.lazycat.app.copyparty'
+              assert str(info['version']) == version
+              assert info['name'] == 'CopyParty'
+              assert info['license'] == 'MIT'
+              assert str(info['min_os_version']) == '1.5.0'
+              assert 'net.internet' in info['permissions']['required']
+
+              text = package.extractfile('manifest.yml').read().decode()
+              m = yaml.safe_load(text)
+              app = m['application']
+              assert app['subdomain'] == 'copyparty'
+              upstreams = app['upstreams']
+              assert any(u['location'] == '/package-licenses/' and u['backend'].startswith('file://') for u in upstreams)
+              assert any(u['location'] == '/' and u['backend'] == 'http://copyparty:3923/' for u in upstreams)
+              assert 'public_path' not in app, 'the file server must stay behind the platform login'
+              assert 'injects' not in app
+
+              svc = m['services']['copyparty']
+              assert svc['image'].startswith('docker.1ms.run/copyparty/ac:')
+              assert svc['command'] == 'sh /lzcapp/pkg/content/start.sh'
+              assert svc['binds'] == ['/lzcapp/var/data:/w']
+              env = '\n'.join(svc['environment'])
+              assert '.U.upload_user' in env and '.U.upload_secret' in env
+              assert 'healthcheck' not in text
+              assert 'lzc-file-chooser' not in text
+
+              params = yaml.safe_load(package.extractfile('deploy_params.yml').read())
+              by_id = {p['id']: p for p in params['params']}
+              assert set(by_id) == {'upload_user', 'upload_secret'}, set(by_id)
+              assert by_id['upload_secret']['type'] == 'secret'
+              assert by_id['upload_secret']['optional'] is False
+              assert by_id['upload_user']['optional'] is False
+
+              with tarfile.open(fileobj=package.extractfile('content.tar')) as content:
+                  members = content.getnames()
+
+                  def read(target):
+                      hits = [n for n in members if n.removeprefix('./') == target]
+                      assert len(hits) == 1, (target, hits)
+                      return content.extractfile(hits[0]).read().decode()
+
+                  start = read('start.sh')
+                  license_text = read('licenses/COPYING.txt')
+
+              # The wrapper must fail closed and must not leak the value.
+              assert 'COPYARTY_USER' in start and 'COPYARTY_PASS' in start
+              assert 'refusing to start' in start
+              assert 'at least 12 characters' in start
+              assert 'chmod 600' in start
+              assert '/run/copyparty' in start, 'rendered config must live on tmpfs'
+              assert 'echo "$USER_PASS"' not in start
+              assert '/lzcapp/var/data' not in start, 'secrets must not be written into the data volume'
+
+              # No shipped config may carry a credential placeholder or value.
+              assert not [n for n in members if n.endswith('copyparty.conf')], 'no static config should ship'
+
+              assert 'MIT License' in license_text
+
+          result = {
+              'verified': True,
+              'tag': tag,
+              'sha256': h.hexdigest(),
+              'size': pkg.stat().st_size,
+              'runtime_tested': False,
+          }
+          print(json.dumps(result))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('Independent cloud artifact verification\n\n' + json.dumps(result, indent=2) + '\n')
